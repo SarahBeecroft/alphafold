@@ -1,13 +1,74 @@
-absl-py==1.0.0
-biopython==1.79
-dm-haiku==0.0.12
-docker==5.0.0
-jax==0.4.26
-matplotlib==3.8.0
-ml-collections==0.1.0
-numpy==1.24.3
-openmm[cuda12]==8.2.0
-pdbfixer==1.12.0
-pytest<8.5.0
-setuptools<72.0.0
-tensorflow-cpu==2.16.1
+absl-py==2.5.0
+aiofiles==25.1.0
+-e git+https://github.com/deepmind/alphafold.git@e9b68483fc8764e7a1906e74a5d1f0ea2137311d#egg=alphafold
+astunparse==1.6.3
+attrs==26.1.0
+biopython==1.88
+certifi==2026.7.22
+charset-normalizer==3.5.1
+chex==0.1.92
+Cython==3.3.0
+dm-haiku==0.0.17
+dm-tree==0.1.10
+etils==1.14.0
+flatbuffers==25.12.19
+flax==0.9.0
+fsspec==2026.7.0
+gast==0.7.0
+google-pasta==0.2.0
+grpcio==1.83.1
+h5py==3.14.0
+humanize==4.16.0
+idna==3.19
+immutabledict==4.3.1
+jax==0.8.2
+jax-rocm7-pjrt @ https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.8.2/jax_rocm7_pjrt-0.8.2+rocm7.1.1-py3-none-manylinux_2_28_x86_64.whl#sha256=42ca6db345cdd04b65ec533745b69b0411a1f50809ebc278b293587bc9078e3e
+jax-rocm7-plugin @ https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.8.2/jax_rocm7_plugin-0.8.2+rocm7.1.1-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=8adc0eb4b8fcca1809ed65ecdb62198ecf733fa56eec8c8558671c3835891a12
+jax-triton==0.3.1
+jaxlib @ https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.8.2/jaxlib-0.8.2+rocm7-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl#sha256=6a5650414cbe8edb815a294fb918d1245c324eb91518d57024553eff2c1297ec
+jmp==0.0.4
+keras==3.15.1
+legacy-cgi @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_legacy-cgi_1761574469/work
+libclang==18.1.1
+markdown-it-py==4.2.0
+mdurl==0.1.2
+ml_collections==1.1.0
+ml_dtypes==0.6.0
+mock==5.2.0
+msgpack==1.2.2
+namex==0.1.0
+numpy @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_numpy_1786330619/work/dist/numpy-2.5.2-cp312-cp312-linux_x86_64.whl#sha256=4a453944a01935c571c5e676b3728c689f3276057187ed3df17f5f028ff18e20
+OpenMM==8.6.0
+OpenMM-HIP-7==8.6.0
+opt_einsum==3.4.0
+optax==0.2.8
+optree==0.20.0
+orbax-checkpoint==0.12.4
+packaging @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_packaging_1785888127/work
+pandas==3.0.5
+pdbfixer @ file:///home/conda/feedstock_root/build_artifacts/pdbfixer_1775865420242/work
+prometheus_client==0.26.0
+protobuf==7.36.0
+psutil==7.2.2
+Pygments==2.21.0
+python-dateutil==2.9.0.post0
+PyYAML==6.0.3
+requests==2.34.2
+rich==15.0.0
+scipy==1.18.1
+setuptools==80.10.2
+simplejson==4.1.2
+six==1.17.0
+tabulate==0.10.0
+tensorflow_cpu==2.21.0
+tensorstore==0.1.85
+termcolor==3.3.0
+toolz==1.1.0
+treescope==0.1.10
+triton==3.6.0
+typing_extensions==4.16.0
+urllib3==2.7.0
+uvloop==0.22.1
+wheel==0.48.0
+wrapt==2.3.0
+zipp==4.1.0

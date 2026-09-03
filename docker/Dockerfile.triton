@@ -1,0 +1,73 @@
+# syntax=docker/dockerfile:1
+#
+# ROCm image for the optional Triton attention path in the AF2 patch.
+# Build from the repository root:
+#   docker build -f docker/Dockerfile.triton -t alphafold-triton .
+
+FROM rocm/dev-ubuntu-24.04:7.1
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH="/opt/venv/bin:/opt/hhsuite/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/opt/hhsuite/lib:${LD_LIBRARY_PATH}"
+# Keep the optimisation opt-out at runtime; unset or set to 0 to use JAX.
+ENV AF2_USE_TRITON=1
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y \
+       build-essential \
+       cmake \
+       git \
+       hmmer \
+       kalign \
+       python3.12 \
+       python3.12-dev \
+       python3.12-venv \
+       tzdata \
+       wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# HH-suite is not distributed by Ubuntu with the database tools AlphaFold needs.
+RUN git clone --branch v3.3.0 --single-branch \
+      https://github.com/soedinglab/hh-suite.git /tmp/hh-suite \
+    && cmake -S /tmp/hh-suite -B /tmp/hh-suite/build \
+      -DCMAKE_INSTALL_PREFIX=/opt/hhsuite \
+    && cmake --build /tmp/hh-suite/build --parallel \
+    && cmake --install /tmp/hh-suite/build \
+    && rm -rf /tmp/hh-suite
+
+RUN python3.12 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir --upgrade pip setuptools
+
+COPY requirements.txt /tmp/alphafold-requirements.txt
+# JAX and the CUDA-specific OpenMM extra are replaced by ROCm-compatible
+# packages below.
+RUN grep -Ev '^(jax==|openmm\[cuda12\])' \
+      /tmp/alphafold-requirements.txt > /tmp/requirements-rocm.txt \
+    && /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements-rocm.txt \
+    && /opt/venv/bin/pip install --no-cache-dir openmm==8.2.0 \
+    && /opt/venv/bin/pip install --no-cache-dir jax==0.8.2 \
+    && /opt/venv/bin/pip install --no-cache-dir \
+      https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.8.2/jaxlib-0.8.2+rocm7-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl \
+      https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.8.2/jax_rocm7_pjrt-0.8.2+rocm7.1.1-py3-none-manylinux_2_28_x86_64.whl \
+      https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.8.2/jax_rocm7_plugin-0.8.2+rocm7.1.1-cp312-cp312-manylinux_2_28_x86_64.whl \
+    && /opt/venv/bin/pip install --no-cache-dir triton==3.6.0 \
+    && /opt/venv/bin/pip install --no-cache-dir --no-deps jax-triton==0.3.1 \
+    && rm -f /tmp/alphafold-requirements.txt /tmp/requirements-rocm.txt
+
+WORKDIR /app/alphafold
+# This copies the patched checkout, including the Triton kernel and its
+# integration in alphafold/model/modules.py. It is intentionally not a
+# dependency-only install.
+COPY . /app/alphafold
+
+RUN wget -q -O alphafold/common/stereo_chemical_props.txt \
+      https://git.scicore.unibas.ch/schwede/openstructure/-/raw/7102c63615b64735c4941278d92b554ec94415f8/modules/mol/alg/src/stereo_chemical_props.txt
+
+# Fail the image build if the Triton patch was accidentally omitted from the
+# build context or this recipe is used with an unpatched AlphaFold checkout.
+RUN test -f alphafold/model/triton/evoformer_attn.py \
+    && grep -q 'from alphafold.model.triton import USE_TRITON' \
+       alphafold/model/modules.py
+
+ENTRYPOINT ["python", "/app/alphafold/run_alphafold.py"]

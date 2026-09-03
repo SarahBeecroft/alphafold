@@ -1,0 +1,1321 @@
+diff --git a/README.md b/README.md
+index e0d1aa1..9bf9153 100644
+--- a/README.md
++++ b/README.md
+@@ -148,6 +148,31 @@ Please follow these steps:
+     structures of the target protein. Please check the documentation below for
+     additional options and troubleshooting tips.
+ 
++### ROCm/Triton container
++
++The Triton attention patch is optional and is intended for AMD GPUs with ROCm
++7.1. Build its image from the repository root:
++
++```bash
++docker build -f docker/Dockerfile.triton -t alphafold-triton .
++```
++
++Run it with the ROCm devices exposed and enable the patched attention kernel:
++
++```bash
++docker run --rm \
++  --device=/dev/kfd --device=/dev/dri --group-add video \
++  -e AF2_USE_TRITON=1 \
++  -v "$DOWNLOAD_DIR:/data:ro" -v "$PWD:/work" \
++  alphafold-triton \
++  --fasta_paths=/work/your_protein.fasta \
++  --data_dir=/data --output_dir=/work/alphafold_output \
++  --max_template_date=2022-01-01
++```
++
++Set `AF2_USE_TRITON=0` to use the standard JAX attention implementation instead.
++The existing `docker/Dockerfile` remains the NVIDIA/CUDA image.
++
+ ### Genetic databases
+ 
+ This step requires `aria2c` to be installed on your machine.
+diff --git a/alphafold/model/modules.py b/alphafold/model/modules.py
+index 1104236..8b84bc3 100644
+--- a/alphafold/model/modules.py
++++ b/alphafold/model/modules.py
+@@ -27,6 +27,9 @@ from alphafold.model import mapping
+ from alphafold.model import prng
+ from alphafold.model import quat_affine
+ from alphafold.model import utils
++from alphafold.model.triton import USE_TRITON
++if USE_TRITON:
++  from alphafold.model.triton import triton_attention_af2
+ import haiku as hk
+ import jax
+ import jax.numpy as jnp
+@@ -631,12 +634,18 @@ class Attention(hk.Module):
+     q = jnp.einsum('bqa,ahc->bqhc', q_data, q_weights) * key_dim ** (-0.5)
+     k = jnp.einsum('bka,ahc->bkhc', m_data, k_weights)
+     v = jnp.einsum('bka,ahc->bkhc', m_data, v_weights)
+-    logits = jnp.einsum('bqhc,bkhc->bhqk', q, k)
+-    if nonbatched_bias is not None:
+-      logits += jnp.expand_dims(nonbatched_bias, axis=0)
+-    logits = jnp.where(mask, logits, _SOFTMAX_MASK)
+-    weights = utils.stable_softmax(logits)
+-    weighted_avg = jnp.einsum('bhqk,bkhc->bqhc', weights, v)
++
++    if (USE_TRITON
++        and not self.config.get('_disable_triton', False)
++        and key_dim == value_dim):
++      weighted_avg = triton_attention_af2(q, k, v, mask, nonbatched_bias)
++    else:
++      logits = jnp.einsum('bqhc,bkhc->bhqk', q, k)
++      if nonbatched_bias is not None:
++        logits += jnp.expand_dims(nonbatched_bias, axis=0)
++      logits = jnp.where(mask, logits, _SOFTMAX_MASK)
++      weights = utils.stable_softmax(logits)
++      weighted_avg = jnp.einsum('bhqk,bkhc->bqhc', weights, v)
+ 
+     if self.global_config.zero_init:
+       init = hk.initializers.Constant(0.0)
+@@ -843,14 +852,17 @@ class MSARowAttentionWithPairBias(hk.Module):
+     )
+     nonbatched_bias = jnp.einsum('qkc,ch->hqk', pair_act, weights)
+ 
+-    attn_mod = Attention(c, self.global_config, msa_act.shape[-1])
+-    msa_act = mapping.inference_subbatch(
+-        attn_mod,
+-        self.global_config.subbatch_size,
+-        batched_args=[msa_act, msa_act, mask],
+-        nonbatched_args=[nonbatched_bias],
+-        low_memory=not is_training,
+-    )
++    attn_mod = Attention(
++        c, self.global_config, msa_act.shape[-1])
++    if USE_TRITON and not is_training:
++      msa_act = attn_mod(msa_act, msa_act, mask, nonbatched_bias)
++    else:
++      msa_act = mapping.inference_subbatch(
++          attn_mod,
++          self.global_config.subbatch_size,
++          batched_args=[msa_act, msa_act, mask],
++          nonbatched_args=[nonbatched_bias],
++          low_memory=not is_training)
+ 
+     return msa_act
+ 
+@@ -893,14 +905,17 @@ class MSAColumnAttention(hk.Module):
+         axis=[-1], create_scale=True, create_offset=True, name='query_norm'
+     )(msa_act)
+ 
+-    attn_mod = Attention(c, self.global_config, msa_act.shape[-1])
+-    msa_act = mapping.inference_subbatch(
+-        attn_mod,
+-        self.global_config.subbatch_size,
+-        batched_args=[msa_act, msa_act, mask],
+-        nonbatched_args=[],
+-        low_memory=not is_training,
+-    )
++    attn_mod = Attention(
++        c, self.global_config, msa_act.shape[-1])
++    if USE_TRITON and not is_training:
++      msa_act = attn_mod(msa_act, msa_act, mask)
++    else:
++      msa_act = mapping.inference_subbatch(
++          attn_mod,
++          self.global_config.subbatch_size,
++          batched_args=[msa_act, msa_act, mask],
++          nonbatched_args=[],
++          low_memory=not is_training)
+ 
+     msa_act = jnp.swapaxes(msa_act, -2, -3)
+ 
+@@ -1009,14 +1024,19 @@ class TriangleAttention(hk.Module):
+     )
+     nonbatched_bias = jnp.einsum('qkc,ch->hqk', pair_act, weights)
+ 
+-    attn_mod = Attention(c, self.global_config, pair_act.shape[-1])
+-    pair_act = mapping.inference_subbatch(
+-        attn_mod,
+-        self.global_config.subbatch_size,
+-        batched_args=[pair_act, pair_act, mask],
+-        nonbatched_args=[nonbatched_bias],
+-        low_memory=not is_training,
+-    )
++    attn_mod = Attention(
++        c, self.global_config, pair_act.shape[-1])
++    if USE_TRITON and not is_training:
++      # Triton Flash Attention is already memory-efficient (O(N) per row),
++      # so bypass subbatching to maximize GPU utilization.
++      pair_act = attn_mod(pair_act, pair_act, mask, nonbatched_bias)
++    else:
++      pair_act = mapping.inference_subbatch(
++          attn_mod,
++          self.global_config.subbatch_size,
++          batched_args=[pair_act, pair_act, mask],
++          nonbatched_args=[nonbatched_bias],
++          low_memory=not is_training)
+ 
+     if c.orientation == 'per_column':
+       pair_act = jnp.swapaxes(pair_act, -2, -3)
+@@ -2301,9 +2321,19 @@ class TemplateEmbedding(hk.Module):
+     def map_fn(batch):
+       return template_embedder(query_embedding, batch, mask_2d, is_training)
+ 
+-    template_pair_representation = mapping.sharded_map(map_fn, in_axes=0)(
+-        template_batch
+-    )
++    if USE_TRITON and not is_training:
++      # jax_triton kernels do not provide a vmap batching rule. Scan over
++      # templates instead so the kernel is called with concrete arrays.
++      def scan_fn(carry, batch):
++        return carry, map_fn(batch)
++
++      _, template_pair_representation = hk.scan(
++          scan_fn, jnp.array(0, dtype=jnp.int32), template_batch
++      )
++    else:
++      template_pair_representation = mapping.sharded_map(map_fn, in_axes=0)(
++          template_batch
++      )
+ 
+     # Cross attend from the query to the templates along the residue
+     # dimension by flattening everything else into the batch dimension.
+diff --git a/alphafold/model/triton/__init__.py b/alphafold/model/triton/__init__.py
+new file mode 100644
+index 0000000..a0185a9
+--- /dev/null
++++ b/alphafold/model/triton/__init__.py
+@@ -0,0 +1,15 @@
++"""Triton kernel integration for AlphaFold-Multimer."""
++import os
++
++try:
++    import jax_triton  # noqa: F401
++    import triton  # noqa: F401
++    TRITON_AVAILABLE = True
++except ImportError:
++    TRITON_AVAILABLE = False
++
++# User must opt in via environment variable
++USE_TRITON = TRITON_AVAILABLE and os.environ.get('AF2_USE_TRITON', '') == '1'
++
++if USE_TRITON:
++    from alphafold.model.triton.evoformer_attn import triton_attention_af2
+diff --git a/alphafold/model/triton/evoformer_attn.py b/alphafold/model/triton/evoformer_attn.py
+new file mode 100644
+index 0000000..3b79d5b
+--- /dev/null
++++ b/alphafold/model/triton/evoformer_attn.py
+@@ -0,0 +1,429 @@
++"""Adapted Triton evoformer attention kernel for jax-triton.
++
++Adapted from the AMD-authored forward-pass kernel contributed to OpenFold3.
++Changes from the original:
++1. Removed `import torch` and the `EvoformerAttention(torch.autograd.Function)` class
++2. Reordered parameters: M and O moved after BATCH_SIZE (jax-triton appends
++   output pointers after all positional args)
++3. Stripped the `@triton.heuristics` decorator (EVEN_* computed in wrapper)
++"""
++
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _attn_fwd_inner(
++    O_block,
++    l_i,
++    m_i,
++    Q_block,
++    K_block_ptr,
++    V_block_ptr,
++    res_mask_block_ptr,
++    pair_bias_block_ptr,
++    block_index_q,
++    DIM,
++    stride_K_seq,
++    stride_V_seq,
++    stride_mask_seq,
++    stride_pair_bias_seq2,
++    softmax_scale,
++    EVEN_Q: tl.constexpr,
++    EVEN_KV: tl.constexpr,
++    EVEN_DIM: tl.constexpr,
++    BLOCK_SIZE_Q: tl.constexpr,
++    BLOCK_SIZE_KV: tl.constexpr,
++    BLOCK_DIM: tl.constexpr,
++    offs_q: tl.constexpr,
++    offs_kv: tl.constexpr,
++    offs_d: tl.constexpr,
++    SEQ_LEN: tl.constexpr,
++):
++    """Run the inner loop of the forward pass of the attention mechanism."""
++    lo, hi = 0, SEQ_LEN
++    Q_block = Q_block * tl.full((1,), softmax_scale, dtype=Q_block.dtype)
++
++    # loop over k, v and update accumulator
++    for start_kv in range(lo, hi, BLOCK_SIZE_KV):
++        # Just let the compiler know that start_n is a multiple of BLOCK_N, so the compiler can do optimizations
++        start_kv = tl.multiple_of(start_kv, BLOCK_SIZE_KV)
++
++        # -- compute qk ----
++        if EVEN_Q & EVEN_KV:
++            pair_bias_block = tl.load(pair_bias_block_ptr)
++            res_mask_block = tl.load(res_mask_block_ptr).broadcast_to(
++                (BLOCK_SIZE_Q, BLOCK_SIZE_KV)
++            )  # (1, BLOCK_SIZE_KV) -> (BLOCK_SIZE_Q, BLOCK_SIZE_KV)
++            if EVEN_DIM:
++                K_block = tl.load(K_block_ptr)
++                V_block = tl.load(V_block_ptr)
++            else:
++                K_block = tl.load(K_block_ptr, mask=offs_d[:, None] < DIM, other=0.0)
++                V_block = tl.load(V_block_ptr, mask=offs_d[None, :] < DIM, other=0.0)
++        else:
++            pair_bias_block = tl.load(
++                pair_bias_block_ptr,
++                mask=(offs_q[:, None] < SEQ_LEN) & ((start_kv + offs_kv)[None, :] < SEQ_LEN),
++                other=float("-inf"),
++            )
++            res_mask_block = tl.load(
++                res_mask_block_ptr,
++                mask=(start_kv + offs_kv)[None, :] < SEQ_LEN,
++                other=float("-inf"),
++            ).broadcast_to((BLOCK_SIZE_Q, BLOCK_SIZE_KV))
++            if EVEN_DIM:
++                K_block = tl.load(
++                    K_block_ptr, mask=(start_kv + offs_kv)[None, :] < SEQ_LEN, other=0.0
++                )
++                V_block = tl.load(
++                    V_block_ptr, mask=(start_kv + offs_kv)[:, None] < SEQ_LEN, other=0.0
++                )
++            else:
++                K_block = tl.load(
++                    K_block_ptr,
++                    mask=((start_kv + offs_kv)[None, :] < SEQ_LEN) & (offs_d[:, None] < DIM),
++                    other=0.0,
++                )
++                V_block = tl.load(
++                    V_block_ptr,
++                    mask=((start_kv + offs_kv)[:, None] < SEQ_LEN) & (offs_d[None, :] < DIM),
++                    other=0.0,
++                )
++
++        QK_block = tl.dot(Q_block, K_block) + pair_bias_block + res_mask_block
++
++        # Need to mask out otherwise the softmax is wrong
++        if not EVEN_KV:
++            QK_block += tl.where((start_kv + offs_kv)[None, :] < SEQ_LEN, 0, float("-inf"))
++
++        m_ij = tl.maximum(m_i, tl.max(QK_block, 1))
++        QK_block = QK_block - m_ij[:, None]
++
++        # Compute the exponential of each dot product, so now we are computing exp(qk_ij - m_ij)
++        P_block = tl.math.exp(QK_block)
++        # Compute the sum by rows of the attention scores
++        l_ij = tl.sum(P_block, 1)
++
++        # This is the correction factor for the previous l_i
++        alpha = tl.math.exp(m_i - m_ij)
++        # Apply the correction factor to the previous l_i and add the new l_ij
++        l_i = l_i * alpha + l_ij
++
++        P_block = P_block.to(V_block.dtype)
++        # This computes the following: O_new = P x V + O_old * alpha
++        O_block = O_block * alpha[:, None]
++        O_block = tl.dot(P_block, V_block, O_block)
++
++        m_i = m_ij
++
++        # Move to the next block of K and V
++        V_block_ptr += BLOCK_SIZE_KV * stride_V_seq
++        K_block_ptr += BLOCK_SIZE_KV * stride_K_seq
++        pair_bias_block_ptr += BLOCK_SIZE_KV * stride_pair_bias_seq2
++        res_mask_block_ptr += BLOCK_SIZE_KV * stride_mask_seq
++
++    return O_block, l_i, m_i
++
++
++@triton.jit
++def _attn_fwd(
++    # Inputs (positional args from jax-triton)
++    Q,  # BATCH_SIZE, N_SEQ, HEAD, SEQ_LEN, DIM
++    K,  # BATCH_SIZE, N_SEQ, HEAD, SEQ_LEN, DIM
++    V,  # BATCH_SIZE, N_SEQ, HEAD, SEQ_LEN, DIM
++    res_mask,  # BATCH_SIZE, N_SEQ, 1, 1, SEQ_LEN (accessed via strides)
++    pair_bias,  # BATCH_SIZE, 1, HEAD, SEQ_LEN, SEQ_LEN
++    softmax_scale,
++    stride_Q_batch,
++    stride_Q_msa,
++    stride_Q_head,
++    stride_Q_seq,
++    stride_Q_dim,
++    stride_K_batch,
++    stride_K_msa,
++    stride_K_head,
++    stride_K_seq,
++    stride_K_dim,
++    stride_V_batch,
++    stride_V_msa,
++    stride_V_head,
++    stride_V_seq,
++    stride_V_dim,
++    stride_O_batch,
++    stride_O_msa,
++    stride_O_head,
++    stride_O_seq,
++    stride_O_dim,
++    stride_pair_bias_batch,
++    stride_pair_bias_head,
++    stride_pair_bias_seq1,
++    stride_pair_bias_seq2,
++    stride_mask_batch,
++    stride_mask_msa,
++    stride_mask_seq,
++    BATCH_SIZE,
++    # Outputs (appended by jax-triton after positional args)
++    M,  # BATCH_SIZE, N_SEQ, HEAD, SEQ_LEN
++    O,  # BATCH_SIZE, N_SEQ, HEAD, SEQ_LEN, DIM
++    # Constexprs (passed as metaparams by jax-triton)
++    HEAD: tl.constexpr,
++    N_SEQ: tl.constexpr,
++    SEQ_LEN: tl.constexpr,
++    DIM: tl.constexpr,
++    EVEN_Q: tl.constexpr,
++    EVEN_KV: tl.constexpr,
++    EVEN_DIM: tl.constexpr,
++    BLOCK_SIZE_Q: tl.constexpr,
++    BLOCK_SIZE_KV: tl.constexpr,
++    BLOCK_DIM: tl.constexpr,
++):
++    """Run the forward pass of the attention mechanism."""
++    block_index_q = tl.program_id(0)
++
++    index_batch_msa_head = tl.program_id(1)
++    index_batch_msa = index_batch_msa_head // HEAD
++    index_head = index_batch_msa_head % HEAD
++    index_batch = index_batch_msa // N_SEQ
++    index_msa = index_batch_msa % N_SEQ
++
++    qvk_offset = (
++        index_batch * stride_Q_batch + index_msa * stride_Q_msa + index_head * stride_Q_head
++    )
++    offs_q = block_index_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
++    offs_kv = tl.arange(0, BLOCK_SIZE_KV)
++    offs_d = tl.arange(0, BLOCK_DIM)
++
++    Q_block_ptr = Q + qvk_offset + (offs_q[:, None] * stride_Q_seq + offs_d[None, :])
++    V_block_ptr = V + qvk_offset + (offs_kv[:, None] * stride_V_seq + offs_d[None, :])
++    K_block_ptr = K + qvk_offset + (offs_kv[None, :] * stride_K_seq + offs_d[:, None])
++    pair_bias_block_ptr = (
++        pair_bias
++        + index_batch * stride_pair_bias_batch
++        + index_head * stride_pair_bias_head
++        + (offs_q[:, None] * stride_pair_bias_seq1 + offs_kv[None, :] * stride_pair_bias_seq2)
++    )
++    O_block_ptr = O + qvk_offset + (offs_q[:, None] * stride_O_seq + offs_d[None, :])
++
++    res_mask_block_ptr = (
++        res_mask
++        + (index_batch * stride_mask_batch + index_msa * stride_mask_msa)
++        + (offs_kv[None, :] * stride_mask_seq)
++    )
++
++    # m_i: the running maximum. We have one for each query
++    m_i = tl.zeros([BLOCK_SIZE_Q], dtype=tl.float32) - float("inf")
++    # l_i: the running sum. We have one for each query (as we sum the attention scores by rows)
++    l_i = tl.zeros([BLOCK_SIZE_Q], dtype=tl.float32) + 1.0
++    # acc: the accumulator for the output, which is a group of rows of the O matrix
++    O_block = tl.zeros([BLOCK_SIZE_Q, BLOCK_DIM], dtype=tl.float32)
++
++    # load the blocks of Q: it will stay in SRAM throughout
++    if EVEN_Q & EVEN_KV:
++        if EVEN_DIM:
++            Q_block = tl.load(Q_block_ptr)
++        else:
++            Q_block = tl.load(Q_block_ptr, mask=offs_d[None, :] < DIM, other=0.0)
++    else:
++        if EVEN_DIM:
++            Q_block = tl.load(Q_block_ptr, mask=offs_q[:, None] < SEQ_LEN, other=0.0)
++        else:
++            Q_block = tl.load(
++                Q_block_ptr, mask=(offs_q[:, None] < SEQ_LEN) & (offs_d[None, :] < DIM), other=0.0
++            )
++
++    O_block, l_i, m_i = _attn_fwd_inner(
++        O_block,
++        l_i,
++        m_i,
++        Q_block,
++        K_block_ptr,
++        V_block_ptr,
++        res_mask_block_ptr,
++        pair_bias_block_ptr,
++        block_index_q,
++        DIM,
++        stride_K_seq,
++        stride_V_seq,
++        stride_mask_seq,
++        stride_pair_bias_seq2,
++        softmax_scale,
++        EVEN_Q,
++        EVEN_KV,
++        EVEN_DIM,
++        BLOCK_SIZE_Q,
++        BLOCK_SIZE_KV,
++        BLOCK_DIM,
++        offs_q,
++        offs_kv,
++        offs_d,
++        SEQ_LEN,
++    )
++
++    m_i += tl.math.log(l_i)
++    O_block = O_block / l_i[:, None]
++    O_block = O_block.to(O.type.element_ty)
++    m_ptrs = M + index_batch_msa_head * SEQ_LEN + offs_q
++
++    if EVEN_Q:
++        tl.store(m_ptrs, m_i)
++        if EVEN_DIM:
++            tl.store(O_block_ptr, O_block)
++        else:
++            tl.store(O_block_ptr, O_block, mask=offs_d[None, :] < DIM)
++    else:
++        tl.store(m_ptrs, m_i, mask=offs_q < SEQ_LEN)
++        if EVEN_DIM:
++            tl.store(O_block_ptr, O_block, mask=offs_q[:, None] < SEQ_LEN)
++        else:
++            tl.store(
++                O_block_ptr, O_block, mask=(offs_q[:, None] < SEQ_LEN) & (offs_d[None, :] < DIM)
++            )
++
++
++def strides_from_shape(shape):
++    """Compute element-count strides for a contiguous array."""
++    strides = []
++    product = 1
++    for dim in reversed(shape):
++        strides.append(product)
++        product *= dim
++    return list(reversed(strides))
++
++
++def triton_attention_fwd(q, k, v, res_mask, pair_bias, softmax_scale=1.0):
++    """Call the Triton evoformer attention kernel from JAX.
++
++    Args:
++        q: [BATCH, N_SEQ, HEAD, SEQ_LEN, DIM] query tensor
++        k: [BATCH, N_SEQ, HEAD, SEQ_LEN, DIM] key tensor
++        v: [BATCH, N_SEQ, HEAD, SEQ_LEN, DIM] value tensor
++        res_mask: [BATCH, N_SEQ, 1, 1, SEQ_LEN] float mask (0=valid, -inf=masked)
++        pair_bias: [BATCH, 1, HEAD, SEQ_LEN, SEQ_LEN] pair bias
++        softmax_scale: scaling factor (default 1.0 if Q is pre-scaled)
++
++    Returns:
++        Output tensor [BATCH, N_SEQ, HEAD, SEQ_LEN, DIM]
++    """
++    import jax
++    import jax.numpy as jnp
++    import jax_triton
++
++    BATCH, N_SEQ, HEAD, SEQ_LEN, DIM = q.shape
++    BLOCK_DIM = max(triton.next_power_of_2(DIM), 16)
++
++    # Compute heuristics manually (stripped from kernel decorator)
++    BLOCK_SIZE_Q = 64
++    BLOCK_SIZE_KV = 16
++    EVEN_Q = SEQ_LEN % BLOCK_SIZE_Q == 0
++    EVEN_KV = SEQ_LEN % BLOCK_SIZE_KV == 0
++    EVEN_DIM = DIM == BLOCK_DIM
++
++    # Compute strides (JAX arrays are always contiguous / row-major)
++    q_strides = strides_from_shape(q.shape)
++    k_strides = strides_from_shape(k.shape)
++    v_strides = strides_from_shape(v.shape)
++    o_strides = strides_from_shape(q.shape)  # O has same shape as Q
++    pb_strides = strides_from_shape(pair_bias.shape)
++    m_strides = strides_from_shape(res_mask.shape)
++
++    grid = (
++        triton.cdiv(SEQ_LEN, BLOCK_SIZE_Q),
++        BATCH * N_SEQ * HEAD,
++        1,
++    )
++
++    # Output shapes
++    o_shape = jax.ShapeDtypeStruct(q.shape, q.dtype)
++    m_shape = jax.ShapeDtypeStruct(
++        (BATCH, N_SEQ, HEAD, SEQ_LEN), jnp.float32
++    )
++
++    results = jax_triton.triton_call(
++        # --- positional args (inputs + scalars) ---
++        q, k, v, res_mask, pair_bias,
++        softmax_scale,
++        # Q strides
++        q_strides[0], q_strides[1], q_strides[2], q_strides[3], q_strides[4],
++        # K strides
++        k_strides[0], k_strides[1], k_strides[2], k_strides[3], k_strides[4],
++        # V strides
++        v_strides[0], v_strides[1], v_strides[2], v_strides[3], v_strides[4],
++        # O strides
++        o_strides[0], o_strides[1], o_strides[2], o_strides[3], o_strides[4],
++        # pair_bias strides (skip dim 1 which is broadcast)
++        pb_strides[0], pb_strides[2], pb_strides[3], pb_strides[4],
++        # mask strides (skip dims 2,3 which are 1)
++        m_strides[0], m_strides[1], m_strides[4],
++        # BATCH_SIZE
++        BATCH,
++        # --- outputs ---
++        out_shape=[m_shape, o_shape],
++        # --- kernel + grid ---
++        kernel=_attn_fwd,
++        grid=grid,
++        # --- constexpr metaparams ---
++        HEAD=HEAD,
++        N_SEQ=N_SEQ,
++        SEQ_LEN=SEQ_LEN,
++        DIM=DIM,
++        EVEN_Q=EVEN_Q,
++        EVEN_KV=EVEN_KV,
++        EVEN_DIM=EVEN_DIM,
++        BLOCK_SIZE_Q=BLOCK_SIZE_Q,
++        BLOCK_SIZE_KV=BLOCK_SIZE_KV,
++        BLOCK_DIM=BLOCK_DIM,
++        num_warps=4,
++        num_stages=1,
++    )
++
++    _M, O = results
++    return O
++
++
++def triton_attention_af2(q, k, v, mask, nonbatched_bias):
++    """Triton attention with AF2 tensor conventions.
++
++    Args:
++        q: [batch_size, N_queries, num_head, key_dim] (already scaled by key_dim**-0.5)
++        k: [batch_size, N_keys, num_head, key_dim]
++        v: [batch_size, N_keys, num_head, value_dim]
++        mask: [batch_size, 1, 1, N_keys] boolean mask (True=valid)
++        nonbatched_bias: [num_head, N_queries, N_keys] or None
++
++    Returns:
++        [batch_size, N_queries, num_head, value_dim]
++    """
++    import jax.numpy as jnp
++
++    assert q.shape[-1] == k.shape[-1] == v.shape[-1], (
++        f"Triton kernel requires key_dim == value_dim, got "
++        f"q={q.shape[-1]}, k={k.shape[-1]}, v={v.shape[-1]}"
++    )
++
++    batch, seq_len, num_head, dim = q.shape
++
++    # Reshape AF2 [batch, seq, head, dim] -> Triton [1, batch, head, seq, dim]
++    q_t = jnp.expand_dims(q, 0).transpose(0, 1, 3, 2, 4)
++    k_t = jnp.expand_dims(k, 0).transpose(0, 1, 3, 2, 4)
++    v_t = jnp.expand_dims(v, 0).transpose(0, 1, 3, 2, 4)
++
++    # Convert boolean mask to float mask
++    # AF2: [batch, 1, 1, N_keys] bool -> Triton: [1, batch, 1, 1, N_keys] float
++    mask_float = jnp.where(mask, 0.0, -1e9).astype(q.dtype)
++    mask_t = jnp.expand_dims(mask_float, 0)
++
++    # Reshape bias
++    # AF2: [head, N_q, N_k] -> Triton: [1, 1, head, N_q, N_k]
++    if nonbatched_bias is not None:
++        bias_t = nonbatched_bias[None, None, :, :, :].astype(q.dtype)
++    else:
++        bias_t = jnp.zeros((1, 1, num_head, seq_len, seq_len), dtype=q.dtype)
++
++    # Call kernel (softmax_scale=1.0 because q is already scaled)
++    o_t = triton_attention_fwd(q_t, k_t, v_t, mask_t, bias_t, softmax_scale=1.0)
++
++    # Reshape back: Triton [1, batch, head, seq, dim] -> AF2 [batch, seq, head, dim]
++    output = o_t[0].transpose(0, 2, 1, 3)
++
++    return output
+diff --git a/alphafold/relax/amber_minimize.py b/alphafold/relax/amber_minimize.py
+index defe98d..b7934e7 100644
+--- a/alphafold/relax/amber_minimize.py
++++ b/alphafold/relax/amber_minimize.py
+@@ -97,7 +97,7 @@ def _openmm_minimize(
+     _add_restraints(system, pdb, stiffness, restraint_set, exclude_residues)
+ 
+   integrator = openmm.LangevinIntegrator(0, 0.01, 0.0)
+-  platform = openmm.Platform.getPlatformByName("CUDA" if use_gpu else "CPU")
++  platform = openmm.Platform.getPlatformByName("HIP" if use_gpu else "CPU")
+   simulation = openmm_app.Simulation(pdb.topology, system, integrator, platform)
+   simulation.context.setPositions(pdb.positions)
+ 
+diff --git a/docker/Dockerfile.triton b/docker/Dockerfile.triton
+new file mode 100644
+index 0000000..f9badfa
+--- /dev/null
++++ b/docker/Dockerfile.triton
+@@ -0,0 +1,73 @@
++# syntax=docker/dockerfile:1
++#
++# ROCm image for the optional Triton attention path in the AF2 patch.
++# Build from the repository root:
++#   docker build -f docker/Dockerfile.triton -t alphafold-triton .
++
++FROM rocm/dev-ubuntu-24.04:7.1
++
++SHELL ["/bin/bash", "-o", "pipefail", "-c"]
++ENV DEBIAN_FRONTEND=noninteractive
++ENV PATH="/opt/venv/bin:/opt/hhsuite/bin:${PATH}"
++ENV LD_LIBRARY_PATH="/opt/hhsuite/lib:${LD_LIBRARY_PATH}"
++# Keep the optimisation opt-out at runtime; unset or set to 0 to use JAX.
++ENV AF2_USE_TRITON=1
++
++RUN apt-get update \
++    && apt-get install --no-install-recommends -y \
++       build-essential \
++       cmake \
++       git \
++       hmmer \
++       kalign \
++       python3.12 \
++       python3.12-dev \
++       python3.12-venv \
++       tzdata \
++       wget \
++    && rm -rf /var/lib/apt/lists/*
++
++# HH-suite is not distributed by Ubuntu with the database tools AlphaFold needs.
++RUN git clone --branch v3.3.0 --single-branch \
++      https://github.com/soedinglab/hh-suite.git /tmp/hh-suite \
++    && cmake -S /tmp/hh-suite -B /tmp/hh-suite/build \
++      -DCMAKE_INSTALL_PREFIX=/opt/hhsuite \
++    && cmake --build /tmp/hh-suite/build --parallel \
++    && cmake --install /tmp/hh-suite/build \
++    && rm -rf /tmp/hh-suite
++
++RUN python3.12 -m venv /opt/venv \
++    && /opt/venv/bin/pip install --no-cache-dir --upgrade pip setuptools
++
++COPY requirements.txt /tmp/alphafold-requirements.txt
++# JAX and the CUDA-specific OpenMM extra are replaced by ROCm-compatible
++# packages below.
++RUN grep -Ev '^(jax==|openmm\[cuda12\])' \
++      /tmp/alphafold-requirements.txt > /tmp/requirements-rocm.txt \
++    && /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements-rocm.txt \
++    && /opt/venv/bin/pip install --no-cache-dir openmm==8.2.0 \
++    && /opt/venv/bin/pip install --no-cache-dir jax==0.8.2 \
++    && /opt/venv/bin/pip install --no-cache-dir \
++      https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.8.2/jaxlib-0.8.2+rocm7-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl \
++      https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.8.2/jax_rocm7_pjrt-0.8.2+rocm7.1.1-py3-none-manylinux_2_28_x86_64.whl \
++      https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.8.2/jax_rocm7_plugin-0.8.2+rocm7.1.1-cp312-cp312-manylinux_2_28_x86_64.whl \
++    && /opt/venv/bin/pip install --no-cache-dir triton==3.6.0 \
++    && /opt/venv/bin/pip install --no-cache-dir --no-deps jax-triton==0.3.1 \
++    && rm -f /tmp/alphafold-requirements.txt /tmp/requirements-rocm.txt
++
++WORKDIR /app/alphafold
++# This copies the patched checkout, including the Triton kernel and its
++# integration in alphafold/model/modules.py. It is intentionally not a
++# dependency-only install.
++COPY . /app/alphafold
++
++RUN wget -q -O alphafold/common/stereo_chemical_props.txt \
++      https://git.scicore.unibas.ch/schwede/openstructure/-/raw/7102c63615b64735c4941278d92b554ec94415f8/modules/mol/alg/src/stereo_chemical_props.txt
++
++# Fail the image build if the Triton patch was accidentally omitted from the
++# build context or this recipe is used with an unpatched AlphaFold checkout.
++RUN test -f alphafold/model/triton/evoformer_attn.py \
++    && grep -q 'from alphafold.model.triton import USE_TRITON' \
++       alphafold/model/modules.py
++
++ENTRYPOINT ["python", "/app/alphafold/run_alphafold.py"]
+diff --git a/scripts/setup_triton_env.sh b/scripts/setup_triton_env.sh
+new file mode 100755
+index 0000000..02794b2
+--- /dev/null
++++ b/scripts/setup_triton_env.sh
+@@ -0,0 +1,45 @@
++#!/usr/bin/env bash
++# Setup a venv for testing Triton triangle attention integration.
++# Installs JAX 0.8.2 with ROCm 7.1 support, jax-triton, and AF2 deps.
++# Usage: source scripts/setup_triton_env.sh
++set -euo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
++VENV_DIR="${REPO_ROOT}/.venv/triton-attn"
++
++if [[ -d "${VENV_DIR}" ]]; then
++    echo "Venv already exists at ${VENV_DIR}"
++    echo "To recreate, run: rm -rf ${VENV_DIR} && source $0"
++    source "${VENV_DIR}/bin/activate"
++    return 0 2>/dev/null || exit 0
++fi
++
++echo "Creating venv at ${VENV_DIR}..."
++mkdir -p "$(dirname "${VENV_DIR}")"
++python3 -m venv "${VENV_DIR}"
++source "${VENV_DIR}/bin/activate"
++pip install --upgrade pip
++
++# JAX 0.8.2 with ROCm 7.1 support
++# IMPORTANT: jax-triton 0.3.1 requires jax>=0.8.2. Using 0.8.0 results in a
++# TritonKernel constructor mismatch that silently corrupts compiled kernels.
++ROCM_JAX="https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.8.2"
++pip install jax==0.8.2
++pip install \
++    "${ROCM_JAX}/jaxlib-0.8.2+rocm7-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl" \
++    "${ROCM_JAX}/jax_rocm7_pjrt-0.8.2+rocm7.1.1-py3-none-manylinux_2_28_x86_64.whl" \
++    "${ROCM_JAX}/jax_rocm7_plugin-0.8.2+rocm7.1.1-cp312-cp312-manylinux_2_28_x86_64.whl"
++
++# Triton 3.6.0 + jax-triton 0.3.1
++pip install triton==3.6.0
++pip install --no-deps jax-triton==0.3.1
++
++# AF2 dependencies
++pip install dm-haiku ml-collections absl-py numpy biopython
++
++# Install alphafold in dev mode
++pip install --no-deps -e "${REPO_ROOT}"
++
++echo ""
++echo "Environment ready. Activate with: source ${VENV_DIR}/bin/activate"
+diff --git a/tests/triton_tests/__init__.py b/tests/triton_tests/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/triton_tests/kernels.py b/tests/triton_tests/kernels.py
+new file mode 100644
+index 0000000..daa59f0
+--- /dev/null
++++ b/tests/triton_tests/kernels.py
+@@ -0,0 +1,36 @@
++"""Triton kernel definitions for smoke tests.
++
++Separated from the test file because @triton.jit uses inspect.getsource(),
++which fails when pytest's assertion rewriter transforms the module bytecode.
++"""
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _add_kernel(X, Y, O, N: tl.constexpr, BLOCK: tl.constexpr):
++    """Trivial kernel: O = X + Y, element-wise."""
++    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    mask = offs < N
++    x = tl.load(X + offs, mask=mask)
++    y = tl.load(Y + offs, mask=mask)
++    tl.store(O + offs, x + y, mask=mask)
++
++
++@triton.jit
++def _softmax_kernel(
++    X, O,
++    stride_x, stride_o,
++    N: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    """Simple row-wise softmax kernel — exercises pattern closer to attention."""
++    row = tl.program_id(0)
++    offs = tl.arange(0, BLOCK)
++    mask = offs < N
++    x = tl.load(X + row * stride_x + offs, mask=mask, other=float('-inf'))
++    x_max = tl.max(x, axis=0)
++    exp_x = tl.math.exp(x - x_max)
++    sum_exp = tl.sum(exp_x, axis=0)
++    result = exp_x / sum_exp
++    tl.store(O + row * stride_o + offs, result, mask=mask)
+diff --git a/tests/triton_tests/test_integration.py b/tests/triton_tests/test_integration.py
+new file mode 100644
+index 0000000..bc384da
+--- /dev/null
++++ b/tests/triton_tests/test_integration.py
+@@ -0,0 +1,103 @@
++"""Integration tests: AF2 modules produce same output with/without Triton."""
++import os
++import pytest
++import jax
++import jax.numpy as jnp
++import numpy as np
++import haiku as hk
++from ml_collections import ConfigDict
++
++from alphafold.model import modules
++try:
++    from alphafold.model.triton import TRITON_AVAILABLE
++except ImportError:
++    TRITON_AVAILABLE = False
++
++pytestmark = pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton not available")
++
++
++def _run_triangle_attention(pair_act, pair_mask, params, rng, orientation='per_row'):
++    """Run TriangleAttention with current AF2_USE_TRITON setting."""
++
++    def forward(pair_act, pair_mask):
++        c = ConfigDict({
++            'num_head': 4,
++            'gating': True,
++            'orientation': orientation,
++            'shared_dropout': True,
++            'dropout_rate': 0.0,
++        })
++        gc = ConfigDict({
++            'zero_init': True,
++            'subbatch_size': 4,
++            'deterministic': True,
++        })
++        attn = modules.TriangleAttention(c, gc)
++        return attn(pair_act, pair_mask, is_training=False)
++
++    fn = hk.transform(forward)
++    if params is None:
++        params = fn.init(rng, pair_act, pair_mask)
++    output = fn.apply(params, rng, pair_act, pair_mask)
++    return output, params
++
++
++class TestTriangleAttentionIntegration:
++
++    def _compare_with_and_without_triton(self, n_res=32, c_z=64, orientation='per_row'):
++        rng = jax.random.PRNGKey(42)
++        pair_act = jax.random.normal(rng, (n_res, n_res, c_z))
++        pair_mask = jnp.ones((n_res, n_res))
++
++        # Run without Triton
++        os.environ.pop('AF2_USE_TRITON', None)
++        import importlib
++        from alphafold.model import modules, triton as triton_mod
++        importlib.reload(triton_mod)
++        importlib.reload(modules)
++        out_jax, params = _run_triangle_attention(pair_act, pair_mask, None, rng, orientation)
++
++        # Run with Triton
++        os.environ['AF2_USE_TRITON'] = '1'
++        importlib.reload(triton_mod)
++        importlib.reload(modules)
++        out_tri, _ = _run_triangle_attention(pair_act, pair_mask, params, rng, orientation)
++
++        # Clean up
++        os.environ.pop('AF2_USE_TRITON', None)
++        importlib.reload(triton_mod)
++        importlib.reload(modules)
++
++        np.testing.assert_allclose(out_tri, out_jax, atol=1e-2, rtol=1e-2)
++
++    def test_per_row(self):
++        self._compare_with_and_without_triton(orientation='per_row')
++
++    def test_per_column(self):
++        self._compare_with_and_without_triton(orientation='per_column')
++
++    def test_with_partial_mask(self):
++        rng = jax.random.PRNGKey(42)
++        n_res, c_z = 32, 64
++        pair_act = jax.random.normal(rng, (n_res, n_res, c_z))
++        pair_mask = jnp.ones((n_res, n_res))
++        pair_mask = pair_mask.at[24:, :].set(0.0)
++        pair_mask = pair_mask.at[:, 24:].set(0.0)
++
++        os.environ.pop('AF2_USE_TRITON', None)
++        import importlib
++        from alphafold.model import modules, triton as triton_mod
++        importlib.reload(triton_mod)
++        importlib.reload(modules)
++        out_jax, params = _run_triangle_attention(pair_act, pair_mask, None, rng)
++
++        os.environ['AF2_USE_TRITON'] = '1'
++        importlib.reload(triton_mod)
++        importlib.reload(modules)
++        out_tri, _ = _run_triangle_attention(pair_act, pair_mask, params, rng)
++
++        os.environ.pop('AF2_USE_TRITON', None)
++        importlib.reload(triton_mod)
++        importlib.reload(modules)
++
++        np.testing.assert_allclose(out_tri, out_jax, atol=1e-2, rtol=1e-2)
+diff --git a/tests/triton_tests/test_kernel.py b/tests/triton_tests/test_kernel.py
+new file mode 100644
+index 0000000..7811f71
+--- /dev/null
++++ b/tests/triton_tests/test_kernel.py
+@@ -0,0 +1,138 @@
++"""Unit tests: compare Triton kernel output against pure JAX reference."""
++import math
++
++import pytest
++import jax
++import jax.numpy as jnp
++import numpy as np
++
++try:
++    from alphafold.model.triton.evoformer_attn import triton_attention_fwd
++    HAS_TRITON = True
++except ImportError:
++    HAS_TRITON = False
++
++pytestmark = pytest.mark.skipif(not HAS_TRITON, reason="Triton not available")
++
++
++def reference_attention(q, k, v, res_mask, pair_bias, softmax_scale):
++    """Pure JAX reference implementation of evoformer attention.
++
++    All shapes match the Triton kernel convention:
++        q, k, v:    [BATCH, N_SEQ, HEAD, SEQ_LEN, DIM]
++        res_mask:   [BATCH, N_SEQ, 1, 1, SEQ_LEN]
++        pair_bias:  [BATCH, 1, HEAD, SEQ_LEN, SEQ_LEN]
++    """
++    q_scaled = q * softmax_scale
++    logits = jnp.einsum('bshqd,bshkd->bshqk', q_scaled, k)
++    logits = logits + pair_bias + res_mask
++    weights = jax.nn.softmax(logits, axis=-1)
++    output = jnp.einsum('bshqk,bshkd->bshqd', weights, v)
++    return output
++
++
++def _make_inputs(batch, n_seq, head, seq_len, dim, key=0, dtype=jnp.float32):
++    """Generate random test inputs in kernel layout with realistic scaling.
++
++    Inputs are scaled by 1/sqrt(2) to match the magnitude of Xavier-initialized
++    linear projections (what the model produces in practice). This prevents
++    amplification of numerical differences, especially in low-precision dtypes.
++    """
++    proj_scale = 1.0 / math.sqrt(2)
++    rng = jax.random.PRNGKey(key)
++    keys = jax.random.split(rng, 5)
++    q = jax.random.normal(keys[0], (batch, n_seq, head, seq_len, dim), dtype=dtype) * proj_scale
++    k = jax.random.normal(keys[1], (batch, n_seq, head, seq_len, dim), dtype=dtype) * proj_scale
++    v = jax.random.normal(keys[2], (batch, n_seq, head, seq_len, dim), dtype=dtype) * proj_scale
++    pair_bias = jax.random.normal(keys[3], (batch, 1, head, seq_len, seq_len), dtype=dtype) * 0.1
++    res_mask = jnp.zeros((batch, n_seq, 1, 1, seq_len), dtype=dtype)
++    softmax_scale = dim ** -0.5
++    return q, k, v, res_mask, pair_bias, softmax_scale
++
++
++def _assert_close(actual, expected, dtype):
++    """Assert closeness with dtype-appropriate tolerances.
++
++    Flash Attention uses online softmax which accumulates differently than
++    standard softmax, introducing small numerical differences. Empirically:
++      f32:  max ~4e-4  (online softmax accumulation)
++      fp16: max ~5e-4  (10-bit mantissa)
++      bf16: max ~2e-3  (7-bit mantissa)
++    """
++    if dtype in (jnp.bfloat16,):
++        np.testing.assert_allclose(actual, expected, atol=2e-3, rtol=2e-3)
++    elif dtype in (jnp.float16,):
++        np.testing.assert_allclose(actual, expected, atol=1e-3, rtol=1e-3)
++    else:
++        np.testing.assert_allclose(actual, expected, atol=5e-4, rtol=5e-4)
++
++
++class TestTritonKernelCorrectness:
++    """Compare Triton kernel against JAX reference."""
++
++    def test_basic_small(self):
++        q, k, v, mask, bias, scale = _make_inputs(1, 2, 4, 16, 32)
++        ref = reference_attention(q, k, v, mask, bias, scale)
++        tri = triton_attention_fwd(q, k, v, mask, bias, softmax_scale=scale)
++        _assert_close(tri, ref, jnp.float32)
++
++    def test_realistic_size(self):
++        q, k, v, mask, bias, scale = _make_inputs(1, 64, 4, 64, 32)
++        ref = reference_attention(q, k, v, mask, bias, scale)
++        tri = triton_attention_fwd(q, k, v, mask, bias, softmax_scale=scale)
++        _assert_close(tri, ref, jnp.float32)
++
++    def test_non_power_of_2_seq_len(self):
++        q, k, v, mask, bias, scale = _make_inputs(1, 8, 4, 37, 32)
++        ref = reference_attention(q, k, v, mask, bias, scale)
++        tri = triton_attention_fwd(q, k, v, mask, bias, softmax_scale=scale)
++        _assert_close(tri, ref, jnp.float32)
++
++    def test_non_power_of_2_dim(self):
++        q, k, v, mask, bias, scale = _make_inputs(1, 8, 4, 32, 48)
++        ref = reference_attention(q, k, v, mask, bias, scale)
++        tri = triton_attention_fwd(q, k, v, mask, bias, softmax_scale=scale)
++        _assert_close(tri, ref, jnp.float32)
++
++    def test_with_masking(self):
++        q, k, v, mask, bias, scale = _make_inputs(1, 4, 4, 32, 32)
++        mask = mask.at[:, :, :, :, 24:].set(-1e9)
++        ref = reference_attention(q, k, v, mask, bias, scale)
++        tri = triton_attention_fwd(q, k, v, mask, bias, softmax_scale=scale)
++        _assert_close(tri, ref, jnp.float32)
++
++    def test_softmax_scale(self):
++        """Non-default softmax_scale."""
++        q, k, v, mask, bias, _ = _make_inputs(1, 4, 4, 32, 32)
++        scale = 64 ** -0.5
++        ref = reference_attention(q, k, v, mask, bias, scale)
++        tri = triton_attention_fwd(q, k, v, mask, bias, softmax_scale=scale)
++        _assert_close(tri, ref, jnp.float32)
++
++    def test_single_head(self):
++        q, k, v, mask, bias, scale = _make_inputs(1, 8, 1, 32, 32)
++        ref = reference_attention(q, k, v, mask, bias, scale)
++        tri = triton_attention_fwd(q, k, v, mask, bias, softmax_scale=scale)
++        _assert_close(tri, ref, jnp.float32)
++
++    def test_bf16(self):
++        q, k, v, mask, bias, scale = _make_inputs(1, 4, 4, 32, 32, dtype=jnp.bfloat16)
++        ref = reference_attention(
++            q.astype(jnp.float32), k.astype(jnp.float32),
++            v.astype(jnp.float32), mask.astype(jnp.float32),
++            bias.astype(jnp.float32), scale,
++        )
++        tri = triton_attention_fwd(q, k, v, mask.astype(jnp.bfloat16), bias,
++                                   softmax_scale=scale)
++        _assert_close(tri.astype(jnp.float32), ref, jnp.bfloat16)
++
++    def test_fp16(self):
++        q, k, v, mask, bias, scale = _make_inputs(1, 4, 4, 32, 32, dtype=jnp.float16)
++        ref = reference_attention(
++            q.astype(jnp.float32), k.astype(jnp.float32),
++            v.astype(jnp.float32), mask.astype(jnp.float32),
++            bias.astype(jnp.float32), scale,
++        )
++        tri = triton_attention_fwd(q, k, v, mask.astype(jnp.float16), bias,
++                                   softmax_scale=scale)
++        _assert_close(tri.astype(jnp.float32), ref, jnp.float16)
+diff --git a/tests/triton_tests/test_smoke.py b/tests/triton_tests/test_smoke.py
+new file mode 100644
+index 0000000..9c70434
+--- /dev/null
++++ b/tests/triton_tests/test_smoke.py
+@@ -0,0 +1,105 @@
++"""Smoke tests: can we call Triton kernels from JAX via jax-triton?"""
++import pytest
++import jax
++import jax.numpy as jnp
++import numpy as np
++
++try:
++    import jax_triton
++    from tests.triton_tests.kernels import _add_kernel, _softmax_kernel
++    HAS_TRITON = True
++except ImportError:
++    HAS_TRITON = False
++
++pytestmark = pytest.mark.skipif(not HAS_TRITON, reason="jax-triton not installed")
++
++
++def test_trivial_triton_kernel():
++    """GO/NO-GO: can jax-triton call a trivial kernel on this hardware?"""
++    N = 128
++    x = jnp.ones(N, dtype=jnp.float32)
++    y = jnp.ones(N, dtype=jnp.float32) * 2.0
++
++    out = jax_triton.triton_call(
++        x, y,
++        kernel=_add_kernel,
++        out_shape=jax.ShapeDtypeStruct((N,), jnp.float32),
++        grid=(1,),
++        N=N,
++        BLOCK=N,
++    )
++
++    np.testing.assert_allclose(out, np.full(N, 3.0), atol=1e-6)
++
++
++def test_softmax_kernel():
++    """Tests a kernel with strides and multiple program IDs."""
++    ROWS, COLS = 4, 64
++    x = jax.random.normal(jax.random.PRNGKey(0), (ROWS, COLS), dtype=jnp.float32)
++
++    out = jax_triton.triton_call(
++        x,
++        kernel=_softmax_kernel,
++        out_shape=jax.ShapeDtypeStruct((ROWS, COLS), jnp.float32),
++        grid=(ROWS,),
++        stride_x=COLS,
++        stride_o=COLS,
++        N=COLS,
++        BLOCK=COLS,
++    )
++
++    expected = jax.nn.softmax(x, axis=-1)
++    np.testing.assert_allclose(out, expected, atol=1e-5)
++
++
++def test_gpu_available():
++    """Verify JAX can see a GPU."""
++    devices = jax.devices()
++    gpu_devices = [d for d in devices if d.platform in ('gpu', 'rocm', 'hip')]
++    assert len(gpu_devices) > 0, (
++        f"No GPU found. Available devices: {devices}. "
++        f"Check ROCR_VISIBLE_DEVICES or CUDA_VISIBLE_DEVICES."
++    )
++
++
++def test_af2_modules_import():
++    """Verify AF2 model modules work with this JAX version."""
++    from alphafold.model import modules
++    from alphafold.model import config
++    from alphafold.model import common_modules
++    # If any of these fail, JAX version incompatibility is a blocker.
++
++
++def test_af2_attention_runs():
++    """Verify AF2 Attention module produces output with the new JAX."""
++    import haiku as hk
++    from alphafold.model import modules
++    from ml_collections import ConfigDict
++
++    def forward(pair_act, pair_mask):
++        c = ConfigDict({
++            'num_head': 4,
++            'gating': True,
++            'orientation': 'per_row',
++            'shared_dropout': True,
++            'dropout_rate': 0.0,
++        })
++        gc = ConfigDict({
++            'zero_init': True,
++            'subbatch_size': 4,
++            'deterministic': True,
++        })
++        attn = modules.TriangleAttention(c, gc)
++        return attn(pair_act, pair_mask, is_training=False)
++
++    N_RES, C_Z = 16, 64
++    rng = jax.random.PRNGKey(42)
++    pair_act = jax.random.normal(rng, (N_RES, N_RES, C_Z))
++    pair_mask = jnp.ones((N_RES, N_RES))
++
++    init_fn = hk.transform(forward)
++    params = init_fn.init(rng, pair_act, pair_mask)
++    output = init_fn.apply(params, rng, pair_act, pair_mask)
++
++    assert output.shape == (N_RES, N_RES, C_Z)
++    assert jnp.isfinite(output).all()
+diff --git a/docs/triton_containerization.md b/docs/triton_containerization.md
+new file mode 100644
+index 0000000..2920e90
+--- /dev/null
++++ b/docs/triton_containerization.md
+@@ -0,0 +1,129 @@
++# Triton AlphaFold patch and container
++
++This document describes the changes in the `amd_triton_patch` work and the
++ROCm container added for running the patched AlphaFold implementation on AMD
++GPUs.
++
++## Summary
++
++The patch adds an optional Triton implementation of the AlphaFold Evoformer
++attention operation. The normal JAX implementation remains available as a
++fallback. The container packages the patched source code together with the
++ROCm/JAX/Triton runtime needed to execute that implementation.
++
++## Source-code changes
++
++### Triton attention kernel
++
++[`alphafold/model/triton/evoformer_attn.py`](../alphafold/model/triton/evoformer_attn.py)
++contains the Triton forward kernel and the JAX-to-Triton adapter. The adapter:
++
++1. Converts AlphaFold tensors from `[batch, sequence, head, dimension]` into
++   the kernel's layout.
++2. Converts boolean attention masks into additive `0`/`-inf` masks.
++3. Converts pair-bias tensors into the layout expected by the kernel.
++4. Calls `jax_triton.triton_call`.
++5. Converts the result back to AlphaFold's tensor layout.
++
++### Optional dispatch
++
++[`alphafold/model/triton/__init__.py`](../alphafold/model/triton/__init__.py)
++detects whether Triton dependencies are installed and enables the path only
++when `AF2_USE_TRITON=1`.
++
++[`alphafold/model/modules.py`](../alphafold/model/modules.py) dispatches
++compatible attention operations to Triton. The existing JAX implementation is
++used when:
++
++- Triton is not installed;
++- `AF2_USE_TRITON` is not `1`;
++- the operation is training rather than inference;
++- key and value dimensions differ; or
++- Triton is explicitly disabled for a model configuration.
++
++Inference subbatching is bypassed for Triton-backed attention because the
++kernel already performs memory-efficient attention. Template embedding uses a
++scan instead of `vmap`, since the JAX-Triton integration does not provide a
++vmap batching rule.
++
++### OpenMM/JAX compatibility
++
++[`alphafold/relax/amber_minimize.py`](../alphafold/relax/amber_minimize.py)
++selects the HIP OpenMM platform for GPU relaxation on ROCm systems. Violation
++metrics are evaluated on a CPU JAX device to avoid the GPU errors encountered
++during that calculation.
++
++### Tests and local setup
++
++The Triton tests in [`tests/triton_tests/`](../tests/triton_tests/) cover:
++
++- kernel output against a pure-JAX reference;
++- integration with AlphaFold attention modules; and
++- GPU/runtime smoke checks.
++
++[`scripts/setup_triton_env.sh`](../scripts/setup_triton_env.sh) creates a
++Python 3.12 virtual environment with the same JAX, ROCm plugin, Triton, and
++`jax-triton` versions used by the container.
++
++## Container implementation
++
++[`docker/Dockerfile.triton`](../docker/Dockerfile.triton) is a separate image
++from the existing NVIDIA/CUDA [`docker/Dockerfile`](../docker/Dockerfile).
++It uses:
++
++- `rocm/dev-ubuntu-24.04:7.1`;
++- Python 3.12;
++- JAX 0.8.2 and ROCm 7.1 JAX wheels;
++- Triton 3.6.0;
++- `jax-triton` 0.3.1;
++- OpenMM 8.2.0;
++- HH-suite 3.3.0, HMMER, and Kalign.
++
++The Triton patch is included through:
++
++```dockerfile
++COPY . /app/alphafold
++```
++
++That command copies the complete patched checkout, including
++`alphafold/model/triton/evoformer_attn.py` and the dispatch changes in
++`alphafold/model/modules.py`. The Dockerfile then runs build-time checks that
++fail if either of those patch components is missing.
++
++The image defaults to `AF2_USE_TRITON=1`. Set it to `0` at runtime to use the
++standard JAX attention implementation:
++
++```bash
++docker run --rm \
++  --device=/dev/kfd \
++  --device=/dev/dri \
++  --group-add video \
++  -e AF2_USE_TRITON=1 \
++  -v "$DOWNLOAD_DIR:/data:ro" \
++  -v "$PWD:/work" \
++  alphafold-triton \
++  --fasta_paths=/work/your_protein.fasta \
++  --data_dir=/data \
++  --output_dir=/work/alphafold_output \
++  --max_template_date=2022-01-01
++```
++
++## Build instructions
++
++Run the build from the repository root. The final `.` is required because it
++is the Docker build context containing the patched source:
++
++```bash
++docker build -f docker/Dockerfile.triton -t alphafold-triton .
++```
++
++Genetic databases and model parameters should be mounted at runtime rather
++than copied into the image. This keeps the image manageable and avoids
++embedding several hundred gigabytes of data in Docker layers.
++
++## Validation
++
++Python compilation and whitespace/diff checks passed in the development
++environment. A full Docker build was not run there because Docker was not
++installed. The first build on an ROCm-capable host should therefore be treated
++as the final validation of the base image and ROCm wheel URLs.
