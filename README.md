@@ -148,6 +148,31 @@ Please follow these steps:
     structures of the target protein. Please check the documentation below for
     additional options and troubleshooting tips.
 
+### ROCm/Triton container
+
+The Triton attention patch is optional and is intended for AMD GPUs with ROCm
+7.1. Build its image from the repository root:
+
+```bash
+docker build -f docker/Dockerfile.triton -t alphafold-triton .
+```
+
+Run it with the ROCm devices exposed and enable the patched attention kernel:
+
+```bash
+docker run --rm \
+  --device=/dev/kfd --device=/dev/dri --group-add video \
+  -e AF2_USE_TRITON=1 \
+  -v "$DOWNLOAD_DIR:/data:ro" -v "$PWD:/work" \
+  alphafold-triton \
+  --fasta_paths=/work/your_protein.fasta \
+  --data_dir=/data --output_dir=/work/alphafold_output \
+  --max_template_date=2022-01-01
+```
+
+The default `AF2_USE_TRITON=0` keeps the standard JAX attention implementation.
+The existing `docker/Dockerfile` remains the NVIDIA/CUDA image.
+
 ### Genetic databases
 
 This step requires `aria2c` to be installed on your machine.
