@@ -170,7 +170,7 @@ docker run --rm \
   --max_template_date=2022-01-01
 ```
 
-The default `AF2_USE_TRITON=0` keeps the standard JAX attention implementation.
+Set `AF2_USE_TRITON=0` to use the standard JAX attention implementation instead.
 The existing `docker/Dockerfile` remains the NVIDIA/CUDA image.
 
 ### Genetic databases

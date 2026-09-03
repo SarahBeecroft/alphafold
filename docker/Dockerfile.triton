@@ -10,8 +10,8 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PATH="/opt/venv/bin:/opt/hhsuite/bin:${PATH}"
 ENV LD_LIBRARY_PATH="/opt/hhsuite/lib:${LD_LIBRARY_PATH}"
-# Keep the optimisation opt-in at runtime; unset or set to 0 to use JAX.
-ENV AF2_USE_TRITON=0
+# Keep the optimisation opt-out at runtime; unset or set to 0 to use JAX.
+ENV AF2_USE_TRITON=1
 
 RUN apt-get update \
     && apt-get install --no-install-recommends -y \
@@ -56,9 +56,18 @@ RUN grep -Ev '^(jax==|openmm\[cuda12\])' \
     && rm -f /tmp/alphafold-requirements.txt /tmp/requirements-rocm.txt
 
 WORKDIR /app/alphafold
+# This copies the patched checkout, including the Triton kernel and its
+# integration in alphafold/model/modules.py. It is intentionally not a
+# dependency-only install.
 COPY . /app/alphafold
 
 RUN wget -q -O alphafold/common/stereo_chemical_props.txt \
       https://git.scicore.unibas.ch/schwede/openstructure/-/raw/7102c63615b64735c4941278d92b554ec94415f8/modules/mol/alg/src/stereo_chemical_props.txt
+
+# Fail the image build if the Triton patch was accidentally omitted from the
+# build context or this recipe is used with an unpatched AlphaFold checkout.
+RUN test -f alphafold/model/triton/evoformer_attn.py \
+    && grep -q 'from alphafold.model.triton import USE_TRITON' \
+       alphafold/model/modules.py
 
 ENTRYPOINT ["python", "/app/alphafold/run_alphafold.py"]
