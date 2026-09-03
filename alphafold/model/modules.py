@@ -27,6 +27,9 @@ from alphafold.model import mapping
 from alphafold.model import prng
 from alphafold.model import quat_affine
 from alphafold.model import utils
+from alphafold.model.triton import USE_TRITON
+if USE_TRITON:
+  from alphafold.model.triton import triton_attention_af2
 import haiku as hk
 import jax
 import jax.numpy as jnp
@@ -631,12 +634,18 @@ class Attention(hk.Module):
     q = jnp.einsum('bqa,ahc->bqhc', q_data, q_weights) * key_dim ** (-0.5)
     k = jnp.einsum('bka,ahc->bkhc', m_data, k_weights)
     v = jnp.einsum('bka,ahc->bkhc', m_data, v_weights)
-    logits = jnp.einsum('bqhc,bkhc->bhqk', q, k)
-    if nonbatched_bias is not None:
-      logits += jnp.expand_dims(nonbatched_bias, axis=0)
-    logits = jnp.where(mask, logits, _SOFTMAX_MASK)
-    weights = utils.stable_softmax(logits)
-    weighted_avg = jnp.einsum('bhqk,bkhc->bqhc', weights, v)
+
+    if (USE_TRITON
+        and not self.config.get('_disable_triton', False)
+        and key_dim == value_dim):
+      weighted_avg = triton_attention_af2(q, k, v, mask, nonbatched_bias)
+    else:
+      logits = jnp.einsum('bqhc,bkhc->bhqk', q, k)
+      if nonbatched_bias is not None:
+        logits += jnp.expand_dims(nonbatched_bias, axis=0)
+      logits = jnp.where(mask, logits, _SOFTMAX_MASK)
+      weights = utils.stable_softmax(logits)
+      weighted_avg = jnp.einsum('bhqk,bkhc->bqhc', weights, v)
 
     if self.global_config.zero_init:
       init = hk.initializers.Constant(0.0)
@@ -843,14 +852,17 @@ class MSARowAttentionWithPairBias(hk.Module):
     )
     nonbatched_bias = jnp.einsum('qkc,ch->hqk', pair_act, weights)
 
-    attn_mod = Attention(c, self.global_config, msa_act.shape[-1])
-    msa_act = mapping.inference_subbatch(
-        attn_mod,
-        self.global_config.subbatch_size,
-        batched_args=[msa_act, msa_act, mask],
-        nonbatched_args=[nonbatched_bias],
-        low_memory=not is_training,
-    )
+    attn_mod = Attention(
+        c, self.global_config, msa_act.shape[-1])
+    if USE_TRITON and not is_training:
+      msa_act = attn_mod(msa_act, msa_act, mask, nonbatched_bias)
+    else:
+      msa_act = mapping.inference_subbatch(
+          attn_mod,
+          self.global_config.subbatch_size,
+          batched_args=[msa_act, msa_act, mask],
+          nonbatched_args=[nonbatched_bias],
+          low_memory=not is_training)
 
     return msa_act
 
@@ -893,14 +905,17 @@ class MSAColumnAttention(hk.Module):
         axis=[-1], create_scale=True, create_offset=True, name='query_norm'
     )(msa_act)
 
-    attn_mod = Attention(c, self.global_config, msa_act.shape[-1])
-    msa_act = mapping.inference_subbatch(
-        attn_mod,
-        self.global_config.subbatch_size,
-        batched_args=[msa_act, msa_act, mask],
-        nonbatched_args=[],
-        low_memory=not is_training,
-    )
+    attn_mod = Attention(
+        c, self.global_config, msa_act.shape[-1])
+    if USE_TRITON and not is_training:
+      msa_act = attn_mod(msa_act, msa_act, mask)
+    else:
+      msa_act = mapping.inference_subbatch(
+          attn_mod,
+          self.global_config.subbatch_size,
+          batched_args=[msa_act, msa_act, mask],
+          nonbatched_args=[],
+          low_memory=not is_training)
 
     msa_act = jnp.swapaxes(msa_act, -2, -3)
 
@@ -1009,14 +1024,19 @@ class TriangleAttention(hk.Module):
     )
     nonbatched_bias = jnp.einsum('qkc,ch->hqk', pair_act, weights)
 
-    attn_mod = Attention(c, self.global_config, pair_act.shape[-1])
-    pair_act = mapping.inference_subbatch(
-        attn_mod,
-        self.global_config.subbatch_size,
-        batched_args=[pair_act, pair_act, mask],
-        nonbatched_args=[nonbatched_bias],
-        low_memory=not is_training,
-    )
+    attn_mod = Attention(
+        c, self.global_config, pair_act.shape[-1])
+    if USE_TRITON and not is_training:
+      # Triton Flash Attention is already memory-efficient (O(N) per row),
+      # so bypass subbatching to maximize GPU utilization.
+      pair_act = attn_mod(pair_act, pair_act, mask, nonbatched_bias)
+    else:
+      pair_act = mapping.inference_subbatch(
+          attn_mod,
+          self.global_config.subbatch_size,
+          batched_args=[pair_act, pair_act, mask],
+          nonbatched_args=[nonbatched_bias],
+          low_memory=not is_training)
 
     if c.orientation == 'per_column':
       pair_act = jnp.swapaxes(pair_act, -2, -3)
@@ -2301,9 +2321,19 @@ class TemplateEmbedding(hk.Module):
     def map_fn(batch):
       return template_embedder(query_embedding, batch, mask_2d, is_training)
 
-    template_pair_representation = mapping.sharded_map(map_fn, in_axes=0)(
-        template_batch
-    )
+    if USE_TRITON and not is_training:
+      # jax_triton kernels do not provide a vmap batching rule. Scan over
+      # templates instead so the kernel is called with concrete arrays.
+      def scan_fn(carry, batch):
+        return carry, map_fn(batch)
+
+      _, template_pair_representation = hk.scan(
+          scan_fn, jnp.array(0, dtype=jnp.int32), template_batch
+      )
+    else:
+      template_pair_representation = mapping.sharded_map(map_fn, in_axes=0)(
+          template_batch
+      )
 
     # Cross attend from the query to the templates along the residue
     # dimension by flattening everything else into the batch dimension.
